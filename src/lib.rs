@@ -4,6 +4,8 @@
 
 use futures::future::{AbortHandle, Abortable};
 use parking_lot::Mutex;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::{future::Future, sync::Arc};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -12,7 +14,7 @@ use tokio::task::JoinHandle;
 #[derive(Clone)]
 pub struct SupervisorHandle {
     aborts: Arc<Mutex<Vec<AbortHandle>>>,
-    shutdown: broadcast::Sender<()>,
+    shutdown_tx: broadcast::Sender<()>,
 }
 
 impl Default for SupervisorHandle {
@@ -26,12 +28,12 @@ impl SupervisorHandle {
         let (shutdown, _) = broadcast::channel(1);
         Self {
             aborts: Arc::new(Mutex::new(Vec::new())),
-            shutdown,
+            shutdown_tx: shutdown,
         }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<()> {
-        self.shutdown.subscribe()
+        self.shutdown_tx.subscribe()
     }
 
     pub fn register(&self, handle: AbortHandle) {
@@ -39,7 +41,7 @@ impl SupervisorHandle {
     }
 
     pub fn shutdown_all(&self) {
-        let _ = self.shutdown.send(());
+        let _ = self.shutdown_tx.send(());
         for handle in self.aborts.lock().drain(..) {
             handle.abort();
         }
@@ -80,6 +82,7 @@ where
 pub struct SupervisedJoinHandle {
     inner: JoinHandle<()>,
     supervisor: Option<SupervisorHandle>,
+    shutdown_triggered: bool,
 }
 
 impl SupervisedJoinHandle {
@@ -87,6 +90,7 @@ impl SupervisedJoinHandle {
         Self {
             inner,
             supervisor: Some(supervisor),
+            shutdown_triggered: false,
         }
     }
 }
@@ -102,12 +106,24 @@ impl Drop for SupervisedJoinHandle {
 impl Future for SupervisedJoinHandle {
     type Output = ();
 
-    fn poll(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        self.supervisor = None;
-        std::pin::Pin::new(&mut self.inner).poll(cx).map(|_| ())
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Poll the inner JoinHandle future
+        let inner_pin = unsafe { self.as_mut().map_unchecked_mut(|s| &mut s.inner) };
+
+        match inner_pin.poll(cx) {
+            Poll::Ready(_) => {
+                // Task completed (normal or panic)
+                // Trigger shutdown once
+                if !self.shutdown_triggered {
+                    if let Some(supervisor) = self.supervisor.take() {
+                        supervisor.shutdown_all();
+                    }
+                    self.shutdown_triggered = true;
+                }
+                Poll::Ready(())
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -126,7 +142,7 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
     use tokio::sync::RwLock;
-    use tokio::time::{Duration, sleep};
+    use tokio::time::Duration;
 
     #[tokio::test]
     async fn test_task_exit_kills_group() {
@@ -136,7 +152,7 @@ mod tests {
         let state1 = state.clone();
         let _h1 = supervise_spawn(
             async move {
-                sleep(Duration::from_millis(5)).await;
+                sleep(5, false).await;
                 state1.write().await.insert("task1");
             },
             supervisor.clone(),
@@ -145,7 +161,7 @@ mod tests {
         let state2 = state.clone();
         let _h2 = supervise_spawn(
             async move {
-                sleep(Duration::from_millis(10)).await;
+                sleep(10, false).await;
                 state2.write().await.insert("task2-should-not-see");
             },
             supervisor.clone(),
@@ -154,13 +170,13 @@ mod tests {
         let state3 = state.clone();
         let _h3 = supervise_spawn(
             async move {
-                sleep(Duration::from_millis(20)).await;
+                sleep(20, false).await;
                 state3.write().await.insert("task3-should-not-see");
             },
             supervisor.clone(),
         );
 
-        sleep(Duration::from_millis(100)).await;
+        sleep(100, true).await;
 
         let state_read = state.read().await;
         assert_eq!(state_read.clone(), HashSet::from(["task1"]));
@@ -175,7 +191,7 @@ mod tests {
         let _h1 = supervise_spawn(
             async move {
                 state1.write().await.insert("task1");
-                sleep(Duration::from_millis(10)).await;
+                sleep(10, false).await;
                 state1.write().await.insert("task1-should-not-see");
             },
             supervisor.clone(),
@@ -185,15 +201,15 @@ mod tests {
         let _h2 = supervise_spawn(
             async move {
                 state2.write().await.insert("task2");
-                sleep(Duration::from_millis(10)).await;
+                sleep(10, false).await;
                 state2.write().await.insert("task2-should-not-see");
             },
             supervisor.clone(),
         );
 
-        sleep(Duration::from_millis(2)).await;
+        sleep(2, true).await;
         supervisor.shutdown_all();
-        sleep(Duration::from_millis(15)).await;
+        sleep(15, true).await;
 
         let state_read = state.read().await;
         assert_eq!(state_read.clone(), HashSet::from(["task1", "task2"]));
@@ -209,7 +225,7 @@ mod tests {
             let _h1 = supervise_spawn(
                 async move {
                     state1.write().await.insert("task1");
-                    sleep(Duration::from_millis(5)).await;
+                    sleep(5, false).await;
                     state1.write().await.insert("task1-should-not-see");
                 },
                 supervisor.clone(),
@@ -219,19 +235,57 @@ mod tests {
             let _h2 = supervise_spawn(
                 async move {
                     state2.write().await.insert("task2");
-                    sleep(Duration::from_millis(10)).await;
+                    sleep(10, false).await;
                     state2.write().await.insert("task2-should-not-see");
                 },
                 supervisor.clone(),
             );
 
-            sleep(Duration::from_millis(2)).await;
+            sleep(2, true).await;
             // _h1 drops here
         }
 
-        sleep(Duration::from_millis(20)).await;
+        sleep(20, true).await;
 
         let state_read = state.read().await;
         assert_eq!(state_read.clone(), HashSet::from(["task1", "task2"]));
+    }
+
+    // create a test for task that panics
+    #[tokio::test]
+    async fn test_task_panic() {
+        let supervisor = SupervisorHandle::new();
+        let state = Arc::new(RwLock::new(HashSet::new()));
+        let state1 = state.clone();
+        let _h1 = supervise_spawn(
+            async move {
+                state1.write().await.insert("task1");
+                sleep(5, false).await;
+                panic!("task1 panicked");
+            },
+            supervisor.clone(),
+        );
+        let state2 = state.clone();
+        let _h2 = supervise_spawn(
+            async move {
+                state2.write().await.insert("task2");
+                sleep(10, false).await;
+                state2.write().await.insert("task2-should-not-see");
+            },
+            supervisor.clone(),
+        );
+        sleep(20, true).await;
+        let state_read = state.read().await;
+        assert_eq!(state_read.clone(), HashSet::from(["task1", "task2"]));
+    }
+
+    async fn sleep(ms: u64, all_in_1_go: bool) {
+        if all_in_1_go {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        } else {
+            for _ in 0..ms {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+            }
+        }
     }
 }
