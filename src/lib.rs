@@ -10,15 +10,12 @@ pub async fn supervised<F>(fut: F, token: CancellationToken)
 where
     F: Future<Output = ()>,
 {
-    let local_token = token.clone();
-
+    let token = token.clone();
     tokio::select! {
         _ = fut => {
-            local_token.cancel(); // task completed, cancel others
+            token.cancel(); // task completed, cancel others
         }
-        _ = token.cancelled() => {
-            // externally cancelled — exit early
-        }
+        _ = token.cancelled() => {} // externally cancelled — exit early
     }
 }
 
