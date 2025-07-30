@@ -11,7 +11,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 /// SupervisorHandle
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct SupervisorHandle {
     aborts: Arc<Mutex<Vec<AbortHandle>>>,
     shutdown_tx: broadcast::Sender<()>,
@@ -79,6 +79,7 @@ where
 }
 
 /// JoinHandle wrapper that triggers shutdown on drop
+#[derive(Debug)]
 pub struct SupervisedJoinHandle {
     inner: JoinHandle<()>,
     supervisor: Option<SupervisorHandle>,
